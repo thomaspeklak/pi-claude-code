@@ -111,6 +111,26 @@ const STRIPPED_REQUEST_HEADERS = new Set([
 
 const STRIPPED_RESPONSE_HEADERS = new Set(["connection", "transfer-encoding", "server", "date"]);
 
+export function parseUpstreamUrl(value: string): URL {
+  let upstream: URL;
+  try {
+    upstream = new URL(value);
+  } catch {
+    throw new Error("Claude Code upstream must be HTTPS or loopback HTTP, without credentials, query or fragment");
+  }
+  const loopback = ["127.0.0.1", "::1", "localhost"].includes(upstream.hostname);
+  if (
+    (upstream.protocol !== "https:" && !(upstream.protocol === "http:" && loopback)) ||
+    upstream.username ||
+    upstream.password ||
+    upstream.search ||
+    upstream.hash
+  ) {
+    throw new Error("Claude Code upstream must be HTTPS or loopback HTTP, without credentials, query or fragment");
+  }
+  return upstream;
+}
+
 export class TurnRelay {
   capture: AnthropicCapture;
   used = false;
@@ -140,17 +160,7 @@ export class TurnRelay {
     transformRequest?: (body: Buffer) => Buffer,
     requestBetas: string[] = [],
   ) {
-    this.upstream = new URL(upstream);
-    const loopback = ["127.0.0.1", "::1", "localhost"].includes(this.upstream.hostname);
-    if (
-      (this.upstream.protocol !== "https:" && !(this.upstream.protocol === "http:" && loopback)) ||
-      this.upstream.username ||
-      this.upstream.password ||
-      this.upstream.search ||
-      this.upstream.hash
-    ) {
-      throw new Error("Claude Code upstream must be HTTPS or a loopback HTTP fixture");
-    }
+    this.upstream = parseUpstreamUrl(upstream);
     this.capture = new AnthropicCapture(onEvent);
     this.transformRequest = transformRequest;
     this.requestBetas = requestBetas;

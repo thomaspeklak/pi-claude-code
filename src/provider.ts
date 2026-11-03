@@ -2,8 +2,22 @@ import { createProvider, type AuthContext, type ProviderEnv } from "@earendil-wo
 import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT } from "./claude-cli.ts";
 import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID } from "./model-catalog.ts";
 import { streamClaudeCode } from "./stream.ts";
+import { envFlagEnabled } from "./env.ts";
 
-const PROVIDER_ENV_NAMES = ["PI_CLAUDE_CODE_COMMAND", "PI_CLAUDE_CODE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"] as const;
+const PROVIDER_ENV_NAMES = [
+  "PI_CLAUDE_CODE_COMMAND",
+  "PI_CLAUDE_CODE_CONFIG_DIR",
+  "CLAUDE_CONFIG_DIR",
+  "PI_CLAUDE_CODE_USE_GATEWAY",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "ANTHROPIC_FOUNDRY_API_KEY",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+] as const;
 
 async function providerEnvironment(ctx: AuthContext): Promise<ProviderEnv | undefined> {
   const env: ProviderEnv = {};
@@ -36,11 +50,11 @@ export function createClaudeCodeProvider() {
   });
   return createProvider({
     id: PROVIDER_ID,
-    name: "Claude Code Subscription (Experimental)",
+    name: "Claude Code (Experimental)",
     baseUrl: "process://claude-code",
     auth: {
       apiKey: {
-        name: "Claude Code login",
+        name: "Claude Code authentication",
         // Report the external Claude Code subscription as OAuth-shaped auth so
         // Pi can label list-price accounting as "(sub)". Requests still resolve
         // through this ambient method; credentials remain owned by Claude Code.
@@ -48,12 +62,12 @@ export function createClaudeCodeProvider() {
           const providerEnv = await providerEnvironment(ctx);
           lastProviderEnv = providerEnv;
           const status = await getClaudeStatus(claudeCodeEnv(), signal);
-          // Only report the provider as configured when Claude Code is
-          // installed and logged in, so Pi hides its models otherwise.
-          if (!status.available || !status.loggedIn) return undefined;
+          if (!status.available || (!status.loggedIn && status.authMethod !== "gateway")) return undefined;
           return {
             type: status.subscription ? "oauth" : "api_key",
-            source: status.subscription ? `Claude Code ${status.plan ?? "subscription"}` : "Claude Code CLI",
+            source: status.authMethod === "gateway"
+              ? "Claude Code gateway"
+              : status.subscription ? `Claude Code ${status.plan ?? "subscription"}` : "Claude Code CLI",
           };
         },
         async resolve({ ctx, signal }) {
@@ -63,7 +77,7 @@ export function createClaudeCodeProvider() {
           return {
             auth: { apiKey: "external-process" },
             env: providerEnv,
-            source: "Claude Code CLI",
+            source: envFlagEnabled(claudeCodeEnv().PI_CLAUDE_CODE_USE_GATEWAY) ? "Claude Code gateway" : "Claude Code CLI",
           };
         },
       },

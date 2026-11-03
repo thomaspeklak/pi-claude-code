@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
-import { TurnRelay } from "./turn-relay.ts";
+import { parseUpstreamUrl, TurnRelay } from "./turn-relay.ts";
 import { usageCreditsAllowed, usageCreditsChargeError, type RateLimitInfo } from "./billing.ts";
 import { envFlagEnabled } from "./env.ts";
 import type { DiscoveredClaudeModel } from "./model-catalog.ts";
@@ -155,9 +155,21 @@ export async function getClaudeStatus(
   envInput: Record<string, string | undefined> = process.env,
   signal?: AbortSignal,
 ): Promise<ClaudeStatus> {
+  signal?.throwIfAborted();
   const env = withConfigDirectory(envInput);
+  const gateway = gatewayUrl(env);
   const command = await resolveClaudeExecutable(env);
   if (!command) return { available: false, loggedIn: false, subscription: false, detail: INSTALL_HINT };
+  if (gateway) {
+    return {
+      available: true,
+      loggedIn: false,
+      subscription: false,
+      authMethod: "gateway",
+      command,
+      detail: "Claude Code gateway is configured; connectivity and model access have not been checked.",
+    };
+  }
   try {
     const result = await captureProcess(command, ["auth", "status"], env, signal);
     const payload = result.stdout.trim().startsWith("{")
@@ -193,6 +205,12 @@ async function readyClaudeCommand(
   signal?: AbortSignal,
 ): Promise<string> {
   const env = withConfigDirectory(envInput);
+  if (gatewayUrl(env)) {
+    signal?.throwIfAborted();
+    const command = await resolveClaudeExecutable(env);
+    if (!command) throw new Error(INSTALL_HINT);
+    return command;
+  }
   const key = JSON.stringify([configuredCommand(env), env.PATH, env.HOME, env.CLAUDE_CONFIG_DIR]);
   const cached = readyStatusCache.get(key);
   if (cached && cached.expires > Date.now()) return cached.command;
@@ -226,6 +244,7 @@ export async function discoverClaudeModels(
 ): Promise<DiscoveredClaudeModel[]> {
   signal?.throwIfAborted();
   const env = processEnvironment(envInput, {});
+  if (gatewayUrl(env)) env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
   const command = await resolveClaudeExecutable(env);
   if (!command) throw new Error(INSTALL_HINT);
 
@@ -420,14 +439,35 @@ function conflictingEnvironment(env: Record<string, string>): string[] {
   return conflicts;
 }
 
+function gatewayUrl(env: Record<string, string>): string | undefined {
+  if (!envFlagEnabled(env.PI_CLAUDE_CODE_USE_GATEWAY)) return undefined;
+  if (!env.ANTHROPIC_BASE_URL?.trim()) {
+    throw new Error("Claude Code gateway mode requires ANTHROPIC_BASE_URL");
+  }
+  const credentials = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"].filter((key) => !!env[key]);
+  if (credentials.length !== 1 || !env[credentials[0]]?.trim()) {
+    throw new Error("Claude Code gateway mode requires exactly one of ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY");
+  }
+  const conflicts = conflictingEnvironment(env).filter(
+    (key) => !["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"].includes(key),
+  );
+  if (env.CLAUDE_CODE_OAUTH_TOKEN) conflicts.push("CLAUDE_CODE_OAUTH_TOKEN");
+  if (conflicts.length) {
+    throw new Error(`Claude Code gateway mode refuses conflicting auth/backend overrides: ${conflicts.join(", ")}`);
+  }
+  return parseUpstreamUrl(env.ANTHROPIC_BASE_URL).href;
+}
+
 function processEnvironment(
   input: Record<string, string | undefined> | undefined,
   extraBody: Record<string, unknown>,
 ): Record<string, string> {
   const env = withConfigDirectory({ ...process.env, ...input });
-  const conflicts = conflictingEnvironment(env);
-  if (conflicts.length) {
-    throw new Error(`Claude Code subscription provider refuses conflicting auth/backend overrides: ${conflicts.join(", ")}`);
+  if (!gatewayUrl(env)) {
+    const conflicts = conflictingEnvironment(env);
+    if (conflicts.length) {
+      throw new Error(`Claude Code subscription provider refuses conflicting auth/backend overrides: ${conflicts.join(", ")}`);
+    }
   }
   delete env.CLAUDE_CODE_EXTRA_BODY;
   Object.assign(env, {
@@ -678,6 +718,8 @@ const MAX_CACHED_CLAUDE_PROCESSES = 2;
 
 interface ClaudeLaunchPlan {
   env: Record<string, string>;
+  upstreamUrl: string;
+  gateway: boolean;
   fingerprint: string;
   timeoutMs: number;
 }
@@ -709,8 +751,15 @@ function frameHistoryHash(frames: NativeFrame[]): string {
 function launchPlan(input: RunClaudeInput): ClaudeLaunchPlan {
   const timeoutMs = input.timeoutMs ?? 180_000;
   const env = processEnvironment(input.env, input.extraBody);
+  const gateway = gatewayUrl(env);
+  if (gateway && input.upstreamUrl && parseUpstreamUrl(input.upstreamUrl).href !== gateway) {
+    throw new Error("Claude Code gateway mode cannot override the configured ANTHROPIC_BASE_URL");
+  }
+  const upstreamUrl = gateway ?? input.upstreamUrl ?? "https://api.anthropic.com";
   return {
     env,
+    upstreamUrl,
+    gateway: gateway !== undefined,
     timeoutMs,
     fingerprint: digest({
       command: configuredCommand(env),
@@ -721,7 +770,7 @@ function launchPlan(input: RunClaudeInput): ClaudeLaunchPlan {
       model: input.model,
       systemPrompt: input.systemPrompt,
       timeoutMs,
-      upstreamUrl: input.upstreamUrl ?? "https://api.anthropic.com",
+      upstreamUrl,
     }),
   };
 }
@@ -745,6 +794,7 @@ class ClaudeProcess {
     private readonly readTask: Promise<void>,
     private readonly exitOutcome: Promise<{ code?: number; error?: Error }>,
     private readonly timeoutMs: number,
+    private readonly gateway: boolean,
   ) {
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => (this.stderr = (this.stderr + chunk).slice(-65_536)));
@@ -752,7 +802,7 @@ class ClaudeProcess {
 
   static async create(input: RunClaudeInput, plan: ClaudeLaunchPlan): Promise<ClaudeProcess> {
     input.signal?.throwIfAborted();
-    const command = await readyClaudeCommand({ ...process.env, ...input.env }, input.signal);
+    const command = await readyClaudeCommand(plan.env, input.signal);
 
     const root = await mkdtemp(join(tmpdir(), "pi-claude-code-"));
     const toolsPath = join(root, "tools.json");
@@ -769,8 +819,10 @@ class ClaudeProcess {
         writeFile(systemPath, input.systemPrompt, "utf8"),
       ]);
 
-      relay = new TurnRelay(input.upstreamUrl ?? "https://api.anthropic.com", plan.timeoutMs);
-      const env = { ...plan.env, ANTHROPIC_BASE_URL: await relay.start() };
+      relay = new TurnRelay(plan.upstreamUrl, plan.timeoutMs);
+      const env: Record<string, string> = { ...plan.env, ANTHROPIC_BASE_URL: await relay.start() };
+      // Discovery uses a separate zero-turn process; this relay admits only Messages.
+      if (plan.gateway) env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "0";
       const mcp = {
         mcpServers: {
           pi: { command: process.execPath, args: [inertMcpPath, toolsPath] },
@@ -835,7 +887,7 @@ class ClaudeProcess {
         (code) => ({ code }),
         (error: unknown) => ({ error: error instanceof Error ? error : new Error(String(error)) }),
       );
-      return new ClaudeProcess(plan.fingerprint, root, child, relay, queue, readTask, exitOutcome, plan.timeoutMs);
+      return new ClaudeProcess(plan.fingerprint, root, child, relay, queue, readTask, exitOutcome, plan.timeoutMs, plan.gateway);
     } catch (error) {
       relay?.abort();
       if (child && child.exitCode === null) killProcessTree(child);
@@ -953,12 +1005,23 @@ class ClaudeProcess {
           break;
         } else if (event.type === "rate_limit_event") {
           if (event.rate_limit_info && typeof event.rate_limit_info === "object") rateLimit = event.rate_limit_info;
-        } else if (event.type === "stream_event" && !this.relay.used) {
+        } else if (event.type === "stream_event" && !this.relay.used && !this.gateway) {
           deliver(event.event);
         }
       }
       await this.relay.settled();
       input.signal?.throwIfAborted();
+
+      if (this.gateway && !this.relay.used) {
+        if (nativeError) throw new Error(`Claude Code API error: ${nativeError}`);
+        if (result?.is_error && assistants.length === 0) {
+          throw new Error(`Claude Code request failed before reaching the turn relay: ${result.subtype ?? "unknown result"}`);
+        }
+        throw new Error(
+          "Claude Code gateway response did not pass through the turn relay. " +
+            "Use a Claude executable or launcher that preserves ANTHROPIC_BASE_URL.",
+        );
+      }
 
       let message: NativeMessage | undefined;
       if (this.relay.used) {
