@@ -2,12 +2,14 @@
 
 This Pi extension lets you use your Claude Pro or Max subscription in Pi by
 routing all Claude model requests through the official Claude Code CLI.
+It also supports explicitly configured gateways that hold provider credentials
+outside the Claude Code process.
 
 Pi still handles conversation history, approvals, compaction, and tool
 execution. Claude Code only talks to the model. It never runs tools itself.
 
 > [!WARNING]
-> **The future of this extension is uncertain.** Right now it works by running
+> **The future of this extension is uncertain.** By default it works by running
 > Pi's requests through the official Claude Code CLI in non-interactive mode
 > (`claude -p`), and that usage counts against your normal Claude subscription
 > limits. In May 2026 Anthropic
@@ -33,7 +35,8 @@ execution. Claude Code only talks to the model. It never runs tools itself.
   npm install -g @anthropic-ai/claude-code
   ```
 
-- A Claude subscription that you are logged into with Claude Code
+- A Claude subscription that you are logged into with Claude Code, or a
+  configured [gateway](#gateways)
 
 ## Installation
 
@@ -41,12 +44,13 @@ execution. Claude Code only talks to the model. It never runs tools itself.
 pi install https://github.com/earendil-works/pi-claude-code
 ```
 
-Then pick a model from the **Claude Code Subscription (Experimental)** provider
+Then pick a model from the **Claude Code (Experimental)** provider
 in Pi.
 
 ## Login and logout
 
-Claude Code handles authentication. Log in and out with the Claude Code CLI:
+By default, Claude Code handles authentication. Log in and out with the Claude
+Code CLI:
 
 ```sh
 claude auth login
@@ -57,8 +61,8 @@ The extension uses whatever login Claude Code currently has. You don't need
 Pi's `/login` or `/logout` for this provider. The extension doesn't read, copy,
 or store your Claude Code credentials.
 
-Run `/claude-code-status` in Pi to check that Claude Code is installed and
-logged in.
+Run `/claude-code-status` in Pi to check the executable and authentication
+configuration.
 
 ## Configuration
 
@@ -68,16 +72,59 @@ These environment variables are optional:
   (default: `claude`).
 - `PI_CLAUDE_CODE_CONFIG_DIR`: Claude Code config directory to use. The
   extension passes it to Claude Code as `CLAUDE_CONFIG_DIR`.
+- `PI_CLAUDE_CODE_USE_GATEWAY`: opt into gateway authentication and routing
+  as described below (disabled by default).
+
+### Gateways
+
+Gateway mode still runs the official Claude Code CLI. Claude sends its request
+through the extension's local turn relay, which forwards it to your gateway.
+Pi continues to own tools and conversation history.
+
+Configure a trusted gateway explicitly. In this example, `GATEWAY_KEY` is the
+gateway's client credential supplied by your existing credential setup:
+
+```sh
+export PI_CLAUDE_CODE_USE_GATEWAY=1
+export PI_CLAUDE_CODE_COMMAND=/absolute/path/to/claude
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+export ANTHROPIC_AUTH_TOKEN="$GATEWAY_KEY"
+pi
+```
+
+Set exactly one of `ANTHROPIC_AUTH_TOKEN` (Bearer authentication) or
+`ANTHROPIC_API_KEY` (`x-api-key` authentication). This mode requires only the
+gateway's client credential; the gateway's upstream credentials stay with it.
+Bedrock, Vertex, Foundry and explicit Claude OAuth-token overrides remain
+unsupported.
+
+The base URL must use HTTPS or loopback HTTP. A path prefix is allowed; do not
+append `/v1/messages`, because the relay adds it. The configured executable
+must preserve the relay's injected `ANTHROPIC_BASE_URL`. Use the native Claude
+binary or a launcher that preserves it; wrappers that replace it bypass the
+relay and their responses are rejected.
+
+Gateway mode does not run `claude auth status` or require a local subscription
+login. `/claude-code-status` reports configuration, not successful connectivity
+or model access. Send a small prompt to verify your gateway. Hosts embedding
+the provider must also recognize gateway mode if they enforce their own local
+subscription checks.
 
 ## Usage and billing
 
-Requests made through this extension count against your Claude subscription's
-usage quota and rate limits, the same as any other Claude Code usage. The
-extension does not give you separate or unlimited usage.
+In the default mode, requests count against your Claude subscription's usage
+quota and rate limits, the same as any other Claude Code usage. The extension
+does not give you separate or unlimited usage.
 
 To avoid silently changing how you're authenticated or billed, the extension
-refuses to run if your environment sets an API key, proxy, Bedrock, Vertex, or
-Foundry override for Claude Code.
+refuses API-key and proxy overrides unless gateway mode is explicitly enabled.
+Bedrock, Vertex and Foundry overrides are always refused.
+
+In gateway mode, the gateway determines upstream authentication, billing and
+quota. The existing usage-credit guard still stops on overage reported by
+Claude Code, but cannot establish how the gateway bills requests. Gateway
+support does not establish eligibility for a particular provider account or
+subscription.
 
 ## Limitations
 

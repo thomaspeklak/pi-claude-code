@@ -17,9 +17,10 @@ request is returned to Pi instead.
 
 ## Authentication
 
-Claude Code owns and stores its credentials. The extension does not read its
-credential files, refresh its tokens, or persist them. Authenticated request
-headers do pass transiently through the local turn relay described below.
+In the default mode, Claude Code owns and stores its credentials. The extension
+does not read its credential files, refresh its tokens, or persist them.
+Authenticated request headers do pass transiently through the local turn relay
+described below.
 
 The provider has an ambient API-key-style auth method without a login flow. Its
 `check()` runs `claude auth status` and reports the provider as configured only
@@ -30,8 +31,23 @@ as a subscription. The provider also declares an `oauth` method, marked
 `isSubscription`, only so Pi's subscription-aware UI works. Its `login()` never
 starts a flow; it tells the user to run `claude auth login`.
 
-Inherited API-key, proxy, Bedrock, Vertex, and Foundry overrides are rejected
-to avoid silently changing authentication or billing.
+By default, inherited API-key, proxy, Bedrock, Vertex, and Foundry overrides
+are rejected to avoid silently changing authentication or billing.
+
+With `PI_CLAUDE_CODE_USE_GATEWAY=1`, an explicit `ANTHROPIC_BASE_URL` and exactly
+one gateway credential (`ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`) replace
+the local subscription login. The extension validates configuration and resolves
+the Claude executable without running `claude auth status`. Status reports
+`authMethod: "gateway"`, with `loggedIn` and `subscription` false; this describes
+local configuration, not verified gateway authentication or model access. The
+provider reports API-key-style availability rather than subscription accounting.
+Bedrock, Vertex, Foundry and explicit Claude OAuth-token overrides are rejected
+in this mode.
+
+The gateway owns upstream credentials and refresh state. Only its client
+credential passes through Claude and the relay. Provider-scoped configuration is
+used consistently for status, discovery and execution. Model discovery still
+asks Claude through its zero-turn initialization protocol.
 
 ## Usage-credit guard
 
@@ -43,6 +59,9 @@ ask for usage credits (for example third-party app classification) are
 rewritten into the same kind of error. The latest rate-limit status is attached
 to the assistant message as a `claude-code.rate-limit` diagnostic.
 
+This guard remains active in gateway mode, but can only observe what Claude
+reports. It cannot determine the gateway's upstream billing arrangement.
+
 ## Process reuse
 
 Linear conversations may reuse a warm Claude Code process. Only exact linear
@@ -50,11 +69,20 @@ continuations reuse one. Branches, edits, configuration changes, errors, and
 tool-use boundaries fall back to a fresh process, which replays Pi's full
 conversation. At most two processes are retained, and no process is retained
 for more than five minutes.
+Changing gateway configuration or its client credential invalidates a warm
+process through the same launch fingerprint.
 
 ## Local turn relay
 
 Each Claude Code worker receives an `ANTHROPIC_BASE_URL` that points to a
 random, loopback-only HTTP route owned by this extension.
+
+The relay normally forwards to Anthropic. In gateway mode it forwards to the
+configured base URL, appending `/v1/messages` after any path prefix. HTTPS and
+loopback HTTP are accepted. Claude still receives the relay URL, not the
+gateway URL. A successful gateway response must have passed through the relay;
+native output alone cannot silently bypass it through a launcher that rewrites
+the environment.
 
 The relay exists because Pi, rather than Claude Code, owns the agent loop and
 tool execution. In particular, it:
